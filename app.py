@@ -4,6 +4,10 @@ import io
 import json
 import os
 import re
+import requests
+from html.parser import HTMLParser
+from html import unescape
+from urllib.parse import urlparse
 from datetime import date, timedelta
 
 import pandas as pd
@@ -25,6 +29,10 @@ if "competitor_query" not in st.session_state:
     st.session_state.competitor_query = ""
 if "generated_packages" not in st.session_state:
     st.session_state.generated_packages = []
+if "crex_match_prefill" not in st.session_state:
+    st.session_state.crex_match_prefill = {}
+if "youtube_keyword_opportunities" not in st.session_state:
+    st.session_state.youtube_keyword_opportunities = []
 
 prefs = st.session_state.preferences
 
@@ -212,6 +220,12 @@ def _build_match_description(topic: str, mode: str, match: dict[str, str],
             details.append(f"Stage: {stage}")
         if match_format:
             details.append(f"Format: {match_format}")
+        venue = _clean_field(match.get("venue"))
+        start_time = _clean_field(match.get("start_time"))
+        if venue:
+            details.append(f"Venue: {venue}")
+        if start_time:
+            details.append(f"Date / Start time (as listed): {start_time}")
         if tournament:
             details.append(f"Tournament / Series: {tournament}")
         if year:
@@ -316,12 +330,190 @@ def _apply_editorial_metadata(packages: list[dict], topic: str, mode: str,
 
 
 
+
+class _CREXParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title_parts, self.text_parts, self.meta = [], [], {}
+        self.in_title = False
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "title":
+            self.in_title = True
+        if tag.lower() == "meta":
+            key = (attrs.get("property") or attrs.get("name") or "").lower()
+            if key and attrs.get("content"):
+                self.meta[key] = unescape(attrs["content"].strip())
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+    def handle_data(self, data):
+        value = re.sub(r"\s+", " ", data or "").strip()
+        if value:
+            self.text_parts.append(value)
+            if self.in_title:
+                self.title_parts.append(value)
+
+
+def _fetch_crex_match(url: str) -> dict[str, str]:
+    """Fetch CREX page and extract available match details."""
+    url = (url or "").strip()
+    if not re.match(r"^https?://(www\.)?crex\.com/", url, flags=re.I):
+        raise ValueError("Enter a valid https://crex.com match URL.")
+    response = requests.get(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }, timeout=20)
+    response.raise_for_status()
+    parser = _CREXParser()
+    parser.feed(response.text)
+    visible = " ".join(parser.text_parts)
+    title = parser.meta.get("og:title") or parser.meta.get("twitter:title") or " ".join(parser.title_parts)
+    title = unescape(re.sub(r"\s+", " ", title)).strip()
+    path = urlparse(url).path.lower()
+    combined = f"{title} {visible} {path}"
+
+    team_a = team_b = ""
+    mt = re.search(r"^(.+?)\s+vs\s+(.+?)(?=\s+(?:1st|2nd|3rd|\d+(?:st|nd|rd|th)|live score|live match|match info|odi tri|t20|test)\b|$)", title, re.I)
+    if mt:
+        team_a, team_b = mt.group(1).strip(" -|"), mt.group(2).strip(" -|")
+    abbr = {"eng":"England","pak":"Pakistan","ind":"India","aus":"Australia","sl":"Sri Lanka",
+            "nz":"New Zealand","wi":"West Indies","sa":"South Africa","ban":"Bangladesh",
+            "afg":"Afghanistan","zim":"Zimbabwe","ire":"Ireland","usa":"USA","nep":"Nepal","can":"Canada"}
+    if not team_a or not team_b:
+        mt = re.search(r"/([a-z]{2,4})-vs-([a-z]{2,4})-", path, re.I)
+        if mt:
+            team_a = abbr.get(mt.group(1).lower(), mt.group(1).upper())
+            team_b = abbr.get(mt.group(2).lower(), mt.group(2).upper())
+
+    fmt = ""
+    if re.search(r"\bODI\b|one.day", combined, re.I) or "-odi-" in path: fmt = "ODI"
+    elif re.search(r"\bT20I\b", combined, re.I) or "-t20i" in path: fmt = "T20I"
+    elif re.search(r"\bT20\b|twenty20", combined, re.I) or "-t20" in path: fmt = "T20"
+    elif re.search(r"\bTest\b", combined, re.I): fmt = "Test"
+    elif re.search(r"\bT10\b", combined, re.I): fmt = "T10"
+
+    stage = ""
+    mt = re.search(r"\b(?:1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th))\s+(?:ODI|T20I?|Test|Match|Semi[- ]?Final|Final|Qualifier|Eliminator)\b", combined, re.I)
+    if mt:
+        stage = re.sub(r"\s+", " ", mt.group(0)).strip()
+    else:
+        mt = re.search(r"-(1st|2nd|3rd|\d+(?:st|nd|rd|th))-match-", path, re.I)
+        if mt:
+            stage = f"{mt.group(1)} {fmt}".strip() if fmt else f"{mt.group(1)} Match"
+
+    tournament = ""
+    mt = re.search(r"(ODI Tri[- ]Series in [A-Za-z ]+? 20\d{2}|Tri[- ]Series in [A-Za-z ]+? 20\d{2}|[A-Za-z ]+? League 20\d{2})", combined, re.I)
+    if mt: tournament = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
+    elif "tri-series" in path: tournament = "ODI Tri-Series in Pakistan"
+
+    venue = ""
+    for pattern in [r"(Rawalpindi Cricket Stadium(?:,\s*Rawalpindi)?)",
+                    r"(Gaddafi Stadium(?:,\s*Lahore)?)",
+                    r"Venue\s*[:\-]\s*([^|,]{3,80}(?:Stadium|Ground|Oval)[^|]{0,40})",
+                    r"at\s+([A-Z][A-Za-z ]+(?:Stadium|Ground|Oval)(?:,\s*[A-Z][A-Za-z ]+)?)"]:
+        mt = re.search(pattern, combined, re.I)
+        if mt:
+            venue = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
+            break
+
+    start_time = ""
+    for pattern in [r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
+                    r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
+                    r"(\d{1,2}\s+[A-Za-z]+\s+20\d{2},?\s+\d{1,2}:\d{2}\s*(?:AM|PM))"]:
+        mt = re.search(pattern, visible, re.I)
+        if mt:
+            start_time = re.sub(r"\s+", " ", mt.group(1)).strip()
+            break
+    mt = re.search(r"\b(20\d{2})\b", f"{title} {path} {visible}")
+    year = mt.group(1) if mt else ""
+    if not team_a or not team_b:
+        raise ValueError("Could not reliably extract both teams. CREX may have blocked the request or rendered details dynamically.")
+    return {"team_a":team_a, "team_b":team_b, "match_number":stage, "match_format":fmt,
+            "tournament":tournament, "year":year, "venue":venue, "start_time":start_time,
+            "source_url":url, "source_title":title}
+
+
+def _research_youtube_keyword_ideas(api_key: str, match: dict[str, str]) -> list[dict]:
+    """Mine public YouTube result titles for keyword ideas, not search-volume estimates."""
+    a, b = match.get("team_a", ""), match.get("team_b", "")
+    fixture = f"{a} vs {b}"
+    queries = [f"{fixture} live score", f"{fixture} live commentary",
+               f"{a} {b} {match.get('match_format') or 'cricket'}"]
+    videos = []
+    for query in queries:
+        videos.extend(dict(v) for v in search_videos(api_key, query, 25, "relevance", "IN", None))
+    unique, seen = [], set()
+    for video in videos:
+        key = video.get("url") or video.get("title", "")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(video)
+    terms = extract_title_terms(unique, limit=40) if unique else []
+    total = max(1, len(unique))
+    rows = []
+    for term, count in terms:
+        term = str(term).strip()
+        if len(term) < 3 or term.casefold() in {"live", "match", "cricket", "today", "video"}:
+            continue
+        share = int(count) / total
+        label = "Less common in this sample" if share <= .30 else ("Moderately common" if share <= .60 else "Very common")
+        rows.append({"Keyword idea":term, "Competitor titles using term":int(count),
+                     "Sample share":f"{share:.0%}", "Observation":label})
+    rows.sort(key=lambda r:(0 if r["Observation"] == "Less common in this sample" else 1,
+                            -r["Competitor titles using term"], r["Keyword idea"].casefold()))
+    return rows[:20]
+
+
+
 def current_topic_and_match() -> tuple[str, str, dict[str, str], str]:
     return (st.session_state.get("topic", ""), st.session_state.get("mode", "Cricket match / live score"),
             st.session_state.get("match", {}), st.session_state.get("extra_description", ""))
 
 if page == "Generate SEO":
-    st.markdown('<div class="ps-hero"><b>Generate metadata for a specific cricket match or any video topic.</b><br><span class="ps-muted">You can generate metadata without an API key. Competitor-derived suggestions require a working YouTube Data API key.</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="ps-hero"><b>Generate metadata for a specific cricket match or any video topic.</b><br><span class="ps-muted">Paste a CREX match URL to prefill fixture details. You can generate metadata without an API key; related YouTube keyword research requires a working API key.</span></div>', unsafe_allow_html=True)
+    with st.form("crex_fetch_form"):
+        crex_url = st.text_input("CREX match URL", value=st.session_state.get("crex_url_input", "https://crex.com/cricket-live-score/eng-vs-pak-2nd-match-odi-tri-series-in-pakistan-2026-match-updates-13NC"), placeholder="https://crex.com/cricket-live-score/...")
+        fetch_crex = st.form_submit_button("Fetch match details from CREX", type="primary", use_container_width=True)
+    if fetch_crex:
+        try:
+            with st.spinner("Fetching match details from CREX..."):
+                fetched = _fetch_crex_match(crex_url)
+                st.session_state.crex_match_prefill = fetched
+                st.session_state.crex_url_input = crex_url.strip()
+
+                # Sync form widgets explicitly; Streamlit otherwise keeps their old
+                # values after reruns, even when a new CREX URL is fetched.
+                st.session_state["team_a_input"] = fetched.get("team_a", "")
+                st.session_state["team_b_input"] = fetched.get("team_b", "")
+                st.session_state["match_number_input"] = fetched.get("match_number", "")
+                allowed_formats = ["", "T20", "T20I", "ODI", "Test", "T10", "The Hundred", "Other"]
+                detected_format = fetched.get("match_format", "")
+                st.session_state["match_format_input"] = detected_format if detected_format in allowed_formats else ""
+                st.session_state["tournament_input"] = fetched.get("tournament", "")
+                st.session_state["year_input"] = fetched.get("year", "")
+                st.session_state["topic_input"] = f"{fetched.get('team_a', '')} vs {fetched.get('team_b', '')}".strip()
+                st.session_state["shorthand_input"] = ""
+                st.session_state["venue_input"] = fetched.get("venue", "")
+                st.session_state["start_time_input"] = fetched.get("start_time", "")
+                st.session_state["cricket_search_query_input"] = f"{fetched.get('team_a', '')} vs {fetched.get('team_b', '')} cricket live".strip()
+                st.session_state.generated_packages = []
+                st.session_state.youtube_keyword_opportunities = []
+            st.success("Match details fetched. Review extracted values before generating metadata.")
+        except Exception as exc:
+            st.error(f"Could not fetch CREX details automatically: {exc}")
+            st.caption("If CREX blocks automated requests or loads details dynamically, enter the missing details manually.")
+    crex_data = st.session_state.get("crex_match_prefill", {})
+    if crex_data:
+        with st.expander("Fetched match details — verify before publishing", expanded=True):
+            st.write(f"**Page title:** {crex_data.get('source_title') or 'Not available'}")
+            st.write(f"**Teams:** {crex_data.get('team_a')} vs {crex_data.get('team_b')}")
+            st.write(f"**Match stage:** {crex_data.get('match_number') or 'Not found'}")
+            st.write(f"**Format:** {crex_data.get('match_format') or 'Not found'}")
+            st.write(f"**Tournament:** {crex_data.get('tournament') or 'Not found'}")
+            st.write(f"**Venue:** {crex_data.get('venue') or 'Not found'}")
+            st.write(f"**Date / time as listed:** {crex_data.get('start_time') or 'Not found'}")
+            st.caption("Verify the venue, date and time before publishing.")
     with st.form("generation_form"):
         mode = st.radio("Video type", ["Cricket match / live score", "General YouTube video"], horizontal=True)
         coverage = st.selectbox(
@@ -338,30 +530,46 @@ if page == "Generate SEO":
         if mode == "Cricket match / live score":
             c1, c2, c3 = st.columns(3)
             with c1:
-                team_a = st.text_input("Team 1", placeholder="India")
+                team_a = st.text_input("Team 1", value=st.session_state.get("crex_match_prefill", {}).get("team_a", ""), placeholder="India", key="team_a_input")
             with c2:
-                team_b = st.text_input("Team 2", placeholder="Australia")
+                team_b = st.text_input("Team 2", value=st.session_state.get("crex_match_prefill", {}).get("team_b", ""), placeholder="Australia", key="team_b_input")
             with c3:
-                match_number = st.text_input("Match stage / number", placeholder="2nd Semi-Final or 3rd T20I")
+                match_number = st.text_input("Match stage / number", value=st.session_state.get("crex_match_prefill", {}).get("match_number", ""), placeholder="2nd Semi-Final or 3rd T20I", key="match_number_input")
             c4, c5, c6 = st.columns(3)
             with c4:
-                match_format = st.selectbox("Match format", ["", "T20", "T20I", "ODI", "Test", "T10", "The Hundred", "Other"])
+                match_format_options = ["", "T20", "T20I", "ODI", "Test", "T10", "The Hundred", "Other"]
+                detected_format = st.session_state.get("crex_match_prefill", {}).get("match_format", "")
+                match_format_index = match_format_options.index(detected_format) if detected_format in match_format_options else 0
+                match_format = st.selectbox("Match format", match_format_options, index=match_format_index, key="match_format_input")
             with c5:
-                tournament = st.text_input("Tournament / series", placeholder="Women's Big Bash League")
+                tournament = st.text_input("Tournament / series", value=st.session_state.get("crex_match_prefill", {}).get("tournament", ""), placeholder="Tournament / series", key="tournament_input")
             with c6:
-                year = st.text_input("Season / year (optional)", value="", placeholder="2026")
+                year_default = st.session_state.get("crex_match_prefill", {}).get("year", "") if st.session_state.get("crex_match_prefill") else str(date.today().year)
+                year = st.text_input("Season / year (optional)", value=year_default, placeholder="2026", key="year_input")
             topic_default = f"{team_a} vs {team_b}".strip() if team_a and team_b else ""
-            topic = st.text_input("Main search phrase", value=topic_default, placeholder="India vs Australia live match")
-            shorthand = st.text_input("Team shorthand (optional)", placeholder="IND vs AUS")
+            topic = st.text_input("Main search phrase", value=topic_default, placeholder="India vs Australia live match", key="topic_input")
+            shorthand = st.text_input("Team shorthand (optional)", placeholder="ENG vs PAK", key="shorthand_input")
+            c7, c8 = st.columns(2)
+            with c7:
+                venue = st.text_input("Stadium / venue", value=st.session_state.get("crex_match_prefill", {}).get("venue", ""), placeholder="Rawalpindi Cricket Stadium", key="venue_input")
+            with c8:
+                start_time = st.text_input("Match date / start time (as listed)", value=st.session_state.get("crex_match_prefill", {}).get("start_time", ""), placeholder="Tuesday, 20 October, 8:00 AM", key="start_time_input")
             match = {"team_a": team_a, "team_b": team_b, "match_number": match_number,
                      "match_format": match_format, "tournament": tournament, "year": year,
+                     "venue": venue, "start_time": start_time,
+                     "source_url": st.session_state.get("crex_match_prefill", {}).get("source_url", ""),
                      "team_shorthand": shorthand}
-            search_query = st.text_input("Competitor search query", value=f"{topic} cricket live".strip(), help="Used only when you click research or generate-with-competitors.")
+            search_query = st.text_input("Competitor search query", value=f"{topic} cricket live".strip(), help="Used only when you click research or generate-with-competitors.", key="cricket_search_query_input")
         else:
-            topic = st.text_input("Main topic / exact video subject", placeholder="How to improve cricket live stream audio")
-            search_query = st.text_input("Competitor search query", value=topic, help="An exact topic helps produce more relevant competitor patterns.")
+            topic = st.text_input("Main topic / exact video subject", placeholder="How to improve cricket live stream audio", key="general_topic_input")
+            search_query = st.text_input("Competitor search query", value=topic, help="An exact topic helps produce more relevant competitor patterns.", key="general_search_query_input")
         extra_description = st.text_area("Additional accurate details to include", placeholder="Venue, start time, players, links, sponsor disclosures, or details specific to this video.", height=100)
         use_competitors = st.checkbox("Use previously fetched competitor research", value=bool(st.session_state.competitor_results))
+        research_keywords = st.checkbox(
+            "Research related YouTube keyword ideas after generation (uses API quota)",
+            value=True,
+            help="Uses public YouTube title samples. Less common in the sample does not prove low competition or easy ranking.",
+        )
         submitted = st.form_submit_button("Generate SEO package", type="primary", use_container_width=True)
 
     if submitted:
@@ -374,6 +582,7 @@ if page == "Generate SEO":
             competitors = st.session_state.competitor_results if use_competitors else []
             if use_competitors and st.session_state.competitor_query.casefold() not in query_norm and st.session_state.competitor_query.casefold() != query_norm:
                 st.warning("The saved competitor query may differ from this video. Check the research results before relying on competitor-derived tags.")
+            st.session_state.youtube_keyword_opportunities = []
             packages = generate_package(topic, mode, match, competitors, prefs, extra_description)
             packages = _apply_editorial_metadata(
                 packages, topic, mode, match, prefs, extra_description, coverage
@@ -384,7 +593,15 @@ if page == "Generate SEO":
             st.session_state.match = match
             st.session_state.extra_description = extra_description
             st.session_state.coverage = coverage
-            st.success("SEO package generated with distinct titles, readable description, and separate tags/hashtags.")
+            if research_keywords and api_key.strip() and mode == "Cricket match / live score":
+                with st.spinner("Searching YouTube for related keyword ideas..."):
+                    try:
+                        st.session_state.youtube_keyword_opportunities = _research_youtube_keyword_ideas(api_key, match)
+                    except Exception as exc:
+                        st.warning(f"SEO package generated, but YouTube keyword research failed: {exc}")
+            elif research_keywords and not api_key.strip():
+                st.info("Add your YouTube Data API key in the sidebar to fetch related YouTube keyword ideas.")
+            st.success("SEO package generated with match details and a human-readable description.")
 
     packages = st.session_state.generated_packages
     if packages:
@@ -410,6 +627,13 @@ if page == "Generate SEO":
         with col_hash:
             st.markdown("#### Hashtags")
             st.code(" ".join(package["hashtags"]), language=None)
+        keyword_ideas = st.session_state.get("youtube_keyword_opportunities", [])
+        if keyword_ideas:
+            st.markdown("#### Related YouTube keyword ideas")
+            st.caption("Derived from public YouTube search-result titles. ‘Less common’ means less frequent in this sample only; it is not verified search volume or a guarantee of easy ranking.")
+            st.dataframe(pd.DataFrame(keyword_ideas), use_container_width=True, hide_index=True)
+            keyword_text = "\n".join(f"{row['Keyword idea']} — {row['Observation']}" for row in keyword_ideas)
+            st.download_button("Download keyword ideas (.txt)", keyword_text, file_name="preet_sports_keyword_ideas.txt", mime="text/plain")
         st.markdown("#### Checklist feedback")
         good_col, improve_col = st.columns(2)
         with good_col:
