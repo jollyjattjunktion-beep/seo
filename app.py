@@ -355,26 +355,70 @@ class _CREXParser(HTMLParser):
                 self.title_parts.append(value)
 
 
-def _extract_class_text(html: str, class_name: str) -> str:
-    """Extract readable text from the first div with the requested CSS class.
+class _ClassTextCollector(HTMLParser):
+    """Collect readable text from every div containing a requested CSS class."""
+    def __init__(self, class_name: str):
+        super().__init__(convert_charrefs=True)
+        self.class_name = class_name.casefold()
+        self.values: list[str] = []
+        self._capture_depth: int | None = None
+        self._capture_parts: list[str] = []
 
-    CREX's venue and match date are rendered inside classed divs. Looking for
-    those classes is more reliable than depending on a venue name or a date
-    string appearing elsewhere in the page text.
-    """
-    pattern = (
-        r'<div\b(?=[^>]*\bclass\s*=\s*(["\'])[^"\']*\b'
-        + re.escape(class_name)
-        + r'\b[^"\']*\1)[^>]*>(.*?)</div\s*>'
-    )
-    found = re.search(pattern, html or "", flags=re.IGNORECASE | re.DOTALL)
-    if not found:
-        return ""
-    fragment = found.group(2)
-    fragment = re.sub(r'<(?:script|style)\b.*?</(?:script|style)\s*>', ' ', fragment,
-                      flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r'<[^>]+>', ' ', fragment)
-    return re.sub(r'\s+', ' ', unescape(text)).strip()
+    def handle_starttag(self, tag, attrs):
+        if tag.casefold() != "div":
+            return
+        attrs_dict = dict(attrs)
+        classes = (attrs_dict.get("class") or "").split()
+        if self._capture_depth is not None:
+            # Count nested divs so we don't stop at the first inner </div>.
+            self._capture_depth += 1
+        elif self.class_name in {item.casefold() for item in classes}:
+            self._capture_depth = 1
+            self._capture_parts = []
+
+    def handle_data(self, data):
+        if self._capture_depth is not None and data:
+            self._capture_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.casefold() == "div" and self._capture_depth is not None:
+            self._capture_depth -= 1
+            if self._capture_depth == 0:
+                value = re.sub(r"\s+", " ", unescape(" ".join(self._capture_parts))).strip()
+                if value:
+                    self.values.append(value)
+                self._capture_depth = None
+                self._capture_parts = []
+
+
+def _extract_class_texts(html: str, class_name: str) -> list[str]:
+    """Return text from all matching classed divs, including nested div content."""
+    collector = _ClassTextCollector(class_name)
+    collector.feed(html or "")
+    return collector.values
+
+
+def _extract_class_text(html: str, class_name: str) -> str:
+    """Backward-compatible helper returning the first classed div's text."""
+    values = _extract_class_texts(html, class_name)
+    return values[0] if values else ""
+
+
+def _looks_like_date_time(value: str) -> bool:
+    """Reject date/time strings accidentally returned as stadium names."""
+    value = _clean_field(value)
+    has_clock = bool(re.search(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", value, re.I))
+    has_weekday = bool(re.search(r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", value, re.I))
+    has_date = bool(re.search(r"\b\d{1,2}\s+[A-Za-z]{3,9}\b", value, re.I))
+    return has_clock and (has_weekday or has_date)
+
+
+def _looks_like_venue(value: str) -> bool:
+    """Accept common cricket-ground names and reject dates/times."""
+    value = _clean_field(value)
+    if not value or _looks_like_date_time(value):
+        return False
+    return bool(re.search(r"\b(?:Oval|Stadium|Ground|Cricket Park|Cricket Club|Sports Ground)\b", value, re.I))
 
 
 def _fetch_crex_match(url: str) -> dict[str, str]:
@@ -401,8 +445,12 @@ def _fetch_crex_match(url: str) -> dict[str, str]:
     # CREX has direct CSS hooks for venue and date/time, for example:
     # <div class="venue">North Sydney Oval</div>
     # <div class="match-date">...<div>Tuesday, 20 October, 1:45 PM</div></div>
-    venue_from_class = _extract_class_text(html, "venue")
-    date_from_class = _extract_class_text(html, "match-date")
+    # Some CREX pages include repeated classed blocks (or hidden fixture tiles).
+    # Check all of them and never accept a clock/date string as a venue name.
+    venue_class_values = _extract_class_texts(html, "venue")
+    venue_from_class = next((value for value in venue_class_values if _looks_like_venue(value)), "")
+    date_class_values = _extract_class_texts(html, "match-date")
+    date_from_class = next((value for value in date_class_values if _looks_like_date_time(value)), "")
 
     # Extract teams from og:title before the stage/format marker.
     team_a = team_b = ""
@@ -488,19 +536,27 @@ def _fetch_crex_match(url: str) -> dict[str, str]:
 
     venue = venue_from_class
     if not venue:
-        for pattern in [
+        # Fall back to recognizable venue names in page text, but don't allow a
+        # date/time fragment to leak into the venue field.
+        venue_patterns = [
             r"(Rawalpindi Cricket Stadium(?:,\s*Rawalpindi)?)",
             r"(Gaddafi Stadium(?:,\s*Lahore)?)",
+            r"([A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,5}\s+(?:Oval|Stadium|Ground))",
             r"Venue\s*[:\-]\s*([^|,]{3,80}(?:Stadium|Ground|Oval)[^|]{0,40})",
             r"at\s+([A-Z][A-Za-z ]+(?:Stadium|Ground|Oval)(?:,\s*[A-Z][A-Za-z ]+)?)",
-        ]:
+        ]
+        for pattern in venue_patterns:
             mt = re.search(pattern, combined, re.I)
             if mt:
-                venue = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
-                break
+                candidate = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
+                if _looks_like_venue(candidate):
+                    venue = candidate
+                    break
+    if _looks_like_date_time(venue):
+        venue = ""
 
     # The match-date class is the source of truth when present; preserve its exact text.
-    start_time = date_from_class
+    start_time = date_from_class if _looks_like_date_time(date_from_class) else ""
     if not start_time:
         for pattern in [
             r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
