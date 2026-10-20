@@ -355,8 +355,30 @@ class _CREXParser(HTMLParser):
                 self.title_parts.append(value)
 
 
+def _extract_class_text(html: str, class_name: str) -> str:
+    """Extract readable text from the first div with the requested CSS class.
+
+    CREX's venue and match date are rendered inside classed divs. Looking for
+    those classes is more reliable than depending on a venue name or a date
+    string appearing elsewhere in the page text.
+    """
+    pattern = (
+        r'<div\b(?=[^>]*\bclass\s*=\s*(["\'])[^"\']*\b'
+        + re.escape(class_name)
+        + r'\b[^"\']*\1)[^>]*>(.*?)</div\s*>'
+    )
+    found = re.search(pattern, html or "", flags=re.IGNORECASE | re.DOTALL)
+    if not found:
+        return ""
+    fragment = found.group(2)
+    fragment = re.sub(r'<(?:script|style)\b.*?</(?:script|style)\s*>', ' ', fragment,
+                      flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<[^>]+>', ' ', fragment)
+    return re.sub(r'\s+', ' ', unescape(text)).strip()
+
+
 def _fetch_crex_match(url: str) -> dict[str, str]:
-    """Fetch CREX page and extract available match details."""
+    """Fetch a CREX match page and extract teams, format, series, venue and time."""
     url = (url or "").strip()
     if not re.match(r"^https?://(www\.)?crex\.com/", url, flags=re.I):
         raise ValueError("Enter a valid https://crex.com match URL.")
@@ -365,21 +387,35 @@ def _fetch_crex_match(url: str) -> dict[str, str]:
         "Accept-Language": "en-US,en;q=0.9"
     }, timeout=20)
     response.raise_for_status()
+    html = response.text
     parser = _CREXParser()
-    parser.feed(response.text)
+    parser.feed(html)
     visible = " ".join(parser.text_parts)
+
+    # Prefer Open Graph metadata, as CREX often puts the full series name there.
     title = parser.meta.get("og:title") or parser.meta.get("twitter:title") or " ".join(parser.title_parts)
     title = unescape(re.sub(r"\s+", " ", title)).strip()
     path = urlparse(url).path.lower()
     combined = f"{title} {visible} {path}"
 
+    # CREX has direct CSS hooks for venue and date/time, for example:
+    # <div class="venue">North Sydney Oval</div>
+    # <div class="match-date">...<div>Tuesday, 20 October, 1:45 PM</div></div>
+    venue_from_class = _extract_class_text(html, "venue")
+    date_from_class = _extract_class_text(html, "match-date")
+
+    # Extract teams from og:title before the stage/format marker.
     team_a = team_b = ""
-    mt = re.search(r"^(.+?)\s+vs\s+(.+?)(?=\s+(?:1st|2nd|3rd|\d+(?:st|nd|rd|th)|live score|live match|match info|odi tri|t20|test)\b|$)", title, re.I)
+    mt = re.search(
+        r"^(.+?)\s+vs\s+(.+?)(?=\s+(?:1st|2nd|3rd|\d+(?:st|nd|rd|th)|live score|live match|match info|odi tri|t20|test)\b|$)",
+        title, re.I
+    )
     if mt:
         team_a, team_b = mt.group(1).strip(" -|"), mt.group(2).strip(" -|")
-    abbr = {"eng":"England","pak":"Pakistan","ind":"India","aus":"Australia","sl":"Sri Lanka",
-            "nz":"New Zealand","wi":"West Indies","sa":"South Africa","ban":"Bangladesh",
-            "afg":"Afghanistan","zim":"Zimbabwe","ire":"Ireland","usa":"USA","nep":"Nepal","can":"Canada"}
+    abbr = {"eng":"England", "pak":"Pakistan", "ind":"India", "aus":"Australia",
+            "sl":"Sri Lanka", "nz":"New Zealand", "wi":"West Indies", "sa":"South Africa",
+            "ban":"Bangladesh", "afg":"Afghanistan", "zim":"Zimbabwe", "ire":"Ireland",
+            "usa":"USA", "nep":"Nepal", "can":"Canada"}
     if not team_a or not team_b:
         mt = re.search(r"/([a-z]{2,4})-vs-([a-z]{2,4})-", path, re.I)
         if mt:
@@ -387,52 +423,104 @@ def _fetch_crex_match(url: str) -> dict[str, str]:
             team_b = abbr.get(mt.group(2).lower(), mt.group(2).upper())
 
     fmt = ""
-    if re.search(r"\bODI\b|one.day", combined, re.I) or "-odi-" in path: fmt = "ODI"
-    elif re.search(r"\bT20I\b", combined, re.I) or "-t20i" in path: fmt = "T20I"
-    elif re.search(r"\bT20\b|twenty20", combined, re.I) or "-t20" in path: fmt = "T20"
-    elif re.search(r"\bTest\b", combined, re.I): fmt = "Test"
-    elif re.search(r"\bT10\b", combined, re.I): fmt = "T10"
+    if re.search(r"\bODI\b|one.day", combined, re.I) or "-odi-" in path:
+        fmt = "ODI"
+    elif re.search(r"\bT20I\b", combined, re.I) or "-t20i" in path:
+        fmt = "T20I"
+    elif re.search(r"\bT20\b|twenty20", combined, re.I) or "-t20" in path:
+        fmt = "T20"
+    elif re.search(r"\bTest\b", combined, re.I):
+        fmt = "Test"
+    elif re.search(r"\bT10\b", combined, re.I):
+        fmt = "T10"
 
+    # Some CREX Open Graph titles use a hyphen, e.g. "2nd-T20".
+    title_stage_match = re.search(
+        r"\b(1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th))\s*[-– ]\s*(ODI|T20I?|Test|T10)\b",
+        title, re.I
+    )
     stage = ""
-    mt = re.search(r"\b(?:1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th))\s+(?:ODI|T20I?|Test|Match|Semi[- ]?Final|Final|Qualifier|Eliminator)\b", combined, re.I)
-    if mt:
-        stage = re.sub(r"\s+", " ", mt.group(0)).strip()
+    if title_stage_match:
+        stage_format = title_stage_match.group(2)
+        stage_format = stage_format.upper() if stage_format.lower() in {"odi", "t20", "t20i", "t10"} else "Test"
+        stage = f"{title_stage_match.group(1)} {stage_format}"
     else:
-        mt = re.search(r"-(1st|2nd|3rd|\d+(?:st|nd|rd|th))-match-", path, re.I)
+        mt = re.search(
+            r"\b(?:1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th))\s+(?:ODI|T20I?|Test|Match|Semi[- ]?Final|Final|Qualifier|Eliminator)\b",
+            combined, re.I
+        )
         if mt:
-            stage = f"{mt.group(1)} {fmt}".strip() if fmt else f"{mt.group(1)} Match"
+            stage = re.sub(r"\s+", " ", mt.group(0)).strip()
+        else:
+            mt = re.search(r"-(1st|2nd|3rd|\d+(?:st|nd|rd|th))-match-", path, re.I)
+            if mt:
+                stage = f"{mt.group(1)} {fmt}".strip() if fmt else f"{mt.group(1)} Match"
 
+    # If the OG title has a stage, the text between that stage and "Live Score"
+    # is the series/tour name (e.g. "New Zealand Women tour of Australia 2026").
     tournament = ""
-    mt = re.search(r"(ODI Tri[- ]Series in [A-Za-z ]+? 20\d{2}|Tri[- ]Series in [A-Za-z ]+? 20\d{2}|[A-Za-z ]+? League 20\d{2})", combined, re.I)
-    if mt: tournament = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
-    elif "tri-series" in path: tournament = "ODI Tri-Series in Pakistan"
+    if title_stage_match:
+        series_tail = title[title_stage_match.end():]
+        series_tail = re.split(
+            r"\b(?:Live Score|Live Match|Match Info|Updates|Scorecard|Highlights|News)\b",
+            series_tail, maxsplit=1, flags=re.I
+        )[0]
+        series_tail = re.sub(r"^[\s,|:–-]+|[\s,|:–-]+$", "", series_tail).strip()
+        if series_tail and re.search(r"\b(?:tour of|series|league|cup|championship|trophy)\b", series_tail, re.I):
+            tournament = series_tail
 
-    venue = ""
-    for pattern in [r"(Rawalpindi Cricket Stadium(?:,\s*Rawalpindi)?)",
-                    r"(Gaddafi Stadium(?:,\s*Lahore)?)",
-                    r"Venue\s*[:\-]\s*([^|,]{3,80}(?:Stadium|Ground|Oval)[^|]{0,40})",
-                    r"at\s+([A-Z][A-Za-z ]+(?:Stadium|Ground|Oval)(?:,\s*[A-Z][A-Za-z ]+)?)"]:
-        mt = re.search(pattern, combined, re.I)
+    if not tournament:
+        mt = re.search(
+            r"([A-Za-z][A-Za-z &'-]*\s+tour of\s+[A-Za-z][A-Za-z &'-]*\s+20\d{2})",
+            title, re.I
+        )
         if mt:
-            venue = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
-            break
+            tournament = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
+        else:
+            mt = re.search(
+                r"(ODI Tri[- ]Series in [A-Za-z ]+? 20\d{2}|Tri[- ]Series in [A-Za-z ]+? 20\d{2}|[A-Za-z ]+? League 20\d{2})",
+                combined, re.I
+            )
+            if mt:
+                tournament = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
+            elif "tri-series" in path:
+                tournament = "ODI Tri-Series in Pakistan"
 
-    start_time = ""
-    for pattern in [r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
-                    r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
-                    r"(\d{1,2}\s+[A-Za-z]+\s+20\d{2},?\s+\d{1,2}:\d{2}\s*(?:AM|PM))"]:
-        mt = re.search(pattern, visible, re.I)
-        if mt:
-            start_time = re.sub(r"\s+", " ", mt.group(1)).strip()
-            break
+    venue = venue_from_class
+    if not venue:
+        for pattern in [
+            r"(Rawalpindi Cricket Stadium(?:,\s*Rawalpindi)?)",
+            r"(Gaddafi Stadium(?:,\s*Lahore)?)",
+            r"Venue\s*[:\-]\s*([^|,]{3,80}(?:Stadium|Ground|Oval)[^|]{0,40})",
+            r"at\s+([A-Z][A-Za-z ]+(?:Stadium|Ground|Oval)(?:,\s*[A-Z][A-Za-z ]+)?)",
+        ]:
+            mt = re.search(pattern, combined, re.I)
+            if mt:
+                venue = re.sub(r"\s+", " ", mt.group(1)).strip(" .,-")
+                break
+
+    # The match-date class is the source of truth when present; preserve its exact text.
+    start_time = date_from_class
+    if not start_time:
+        for pattern in [
+            r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
+            r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
+            r"(\d{1,2}\s+[A-Za-z]+\s+20\d{2},?\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
+        ]:
+            mt = re.search(pattern, visible, re.I)
+            if mt:
+                start_time = re.sub(r"\s+", " ", mt.group(1)).strip()
+                break
+
     mt = re.search(r"\b(20\d{2})\b", f"{title} {path} {visible}")
     year = mt.group(1) if mt else ""
     if not team_a or not team_b:
         raise ValueError("Could not reliably extract both teams. CREX may have blocked the request or rendered details dynamically.")
-    return {"team_a":team_a, "team_b":team_b, "match_number":stage, "match_format":fmt,
-            "tournament":tournament, "year":year, "venue":venue, "start_time":start_time,
-            "source_url":url, "source_title":title}
-
+    return {
+        "team_a": team_a, "team_b": team_b, "match_number": stage, "match_format": fmt,
+        "tournament": tournament, "year": year, "venue": venue, "start_time": start_time,
+        "source_url": url, "source_title": title,
+    }
 
 def _research_youtube_keyword_ideas(api_key: str, match: dict[str, str]) -> list[dict]:
     """Mine public YouTube result titles for keyword ideas, not search-volume estimates."""
